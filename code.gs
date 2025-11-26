@@ -28,7 +28,8 @@ const SHEET_NAMES = {
   warnings: "Warnings",
   financialEntitlements: "Financial_Entitlements",
   rbac: "RBAC_Config",// NEW
-  overtime: "Overtime_Requests"
+  overtime: "Overtime_Requests",
+  breakRules: "Break_Rules" // NEW PHASE 9
 };
 // --- Break Time Configuration (in seconds) ---
 const PLANNED_BREAK_SECONDS = 15 * 60; // 15 minutes
@@ -2951,13 +2952,14 @@ function importScheduleCSV(adminEmail, csvData) {
   return `Import successful. Records Created: ${daysCreated}, Records Updated: ${daysUpdated}.`;
 }
 
-// REPLACE this function
 function getDashboardData(adminEmail, userEmails, date) {
   const ss = getSpreadsheet();
   const dbSheet = getOrCreateSheet(ss, SHEET_NAMES.database);
   const userData = getUserDataFromDb(dbSheet);
   const adminRole = userData.emailToRole[adminEmail] || 'agent';
-  if (adminRole !== 'admin' && adminRole !== 'superadmin') {
+  
+  // 1. Permission Check
+  if (adminRole !== 'admin' && adminRole !== 'superadmin' && adminRole !== 'manager') {
     throw new Error("Permission denied.");
   }
   
@@ -2965,150 +2967,122 @@ function getDashboardData(adminEmail, userEmails, date) {
   const targetDate = new Date(date);
   const targetDateStr = Utilities.formatDate(targetDate, timeZone, "MM/dd/yyyy");
   const targetUserSet = new Set(userEmails.map(e => e.toLowerCase()));
-  const userStatusMap = {};
   
-  const totalAdherenceMetrics = {
-    totalTardy: 0, totalEarlyLeave: 0, totalOvertime: 0,
-    totalBreakExceed: 0, totalLunchExceed: 0
-  };
-  
-  const userMetricsMap = {}; 
-  userEmails.forEach(email => {
-    const lEmail = email.toLowerCase();
-    const name = userData.emailToName[lEmail] || lEmail;
-    // *** MODIFIED for Request 3: Default is now "Day Off" ***
-    userStatusMap[lEmail] = "Day Off"; 
-    userMetricsMap[name] = {
-      name: name, tardy: 0, earlyLeave: 0, overtime: 0,
-      breakExceed: 0, lunchExceed: 0
-    };
-  });
+  // --- 2. Get Break Configuration (Dynamic Rules) ---
+  const rulesSheet = getOrCreateSheet(ss, SHEET_NAMES.breakRules);
+  const rulesData = rulesSheet.getDataRange().getValues();
+  const breakRules = {}; // Map: BreakType -> Duration
+  for(let i=1; i<rulesData.length; i++) {
+    // Key: "First Break", Value: 15 (Minutes)
+    // rulesData[i][2] is BreakType, rulesData[i][3] is Duration
+    if(rulesData[i][2]) {
+        breakRules[rulesData[i][2]] = rulesData[i][3]; 
+    }
+  }
 
-  const usersScheduledToday = new Set(); 
-
-  // 1. Get Today's Schedule
+  // --- 3. Get Today's Schedule (including WFM windows) ---
   const scheduleSheet = getOrCreateSheet(ss, SHEET_NAMES.schedule);
   const scheduleData = scheduleSheet.getDataRange().getValues();
-  
+  const userScheduleMap = {};
+
   for (let i = 1; i < scheduleData.length; i++) {
     const row = scheduleData[i];
-    // *** MODIFIED: Read Email from Col G (index 6) ***
-    const schEmail = (row[6] || "").toLowerCase();
-    
+    const schEmail = (row[6] || "").toLowerCase(); // Col G is Email
     if (!targetUserSet.has(schEmail)) continue;
     
-    // *** MODIFIED: Read Date from Col B (index 1) ***
-    const schDate = new Date(row[1]); 
+    const schDate = new Date(row[1]); // Col B is Date
     const schDateStr = Utilities.formatDate(schDate, timeZone, "MM/dd/yyyy");
     
     if (schDateStr === targetDateStr) {
-      // *** MODIFIED: Read LeaveType from Col F (index 5) ***
-      const leaveType = (row[5] || "").toString().trim().toLowerCase();
-      // *** MODIFIED: Read StartTime from Col C (index 2) ***
-      const startTime = row[2]; 
-
-      // *** MODIFIED for Request 3: Handle "Day Off" (empty type, empty time) ***
-      if (leaveType === "" && !startTime) {
-        userStatusMap[schEmail] = "Day Off";
-      } else if (leaveType === "present" || (leaveType === "" && startTime)) {
-        usersScheduledToday.add(schEmail);
-        userStatusMap[schEmail] = "Pending Login";
-      } else if (leaveType === "absent") {
-        userStatusMap[schEmail] = "Absent";
-      } else {
-        userStatusMap[schEmail] = "On Leave";
-      }
+      userScheduleMap[schEmail] = {
+        start: row[2] ? Utilities.formatDate(new Date(row[2]), timeZone, "HH:mm") : "",
+        end: row[4] ? Utilities.formatDate(new Date(row[4]), timeZone, "HH:mm") : "",
+        leaveType: row[5] || "",
+        // New WFM Window Columns (H, I, J, K, L, M)
+        break1Window: row[7] ? Utilities.formatDate(new Date(row[7]), timeZone, "HH:mm") : "",
+        lunchWindow: row[9] ? Utilities.formatDate(new Date(row[9]), timeZone, "HH:mm") : "",
+        break2Window: row[11] ? Utilities.formatDate(new Date(row[11]), timeZone, "HH:mm") : ""
+      };
     }
   }
-  
-  // 2. Get Today's Adherence
+
+  // --- 4. Get Live Adherence Status & Metrics ---
   const adherenceSheet = getOrCreateSheet(ss, SHEET_NAMES.adherence);
   const adherenceData = adherenceSheet.getDataRange().getValues();
-  
-  const otherCodesSheet = getOrCreateSheet(ss, SHEET_NAMES.otherCodes);
-  const otherCodesData = otherCodesSheet.getDataRange().getValues();
-  const userLastOtherCode = {}; 
-  
-  for (let i = otherCodesData.length - 1; i > 0; i--) { 
-    const row = otherCodesData[i];
-    const rowDate = new Date(row[0]);
-    const rowShiftDate = getShiftDate(rowDate, SHIFT_CUTOFF_HOUR);
-    const rowDateStr = Utilities.formatDate(rowShiftDate, timeZone, "MM/dd/yyyy");
-    
-    if (rowDateStr === targetDateStr) {
-      const userName = row[1];
-      const userEmail = userData.nameToEmail[userName];
-      
-      if (userEmail && targetUserSet.has(userEmail.toLowerCase())) {
-        if (!userLastOtherCode[userEmail.toLowerCase()]) { 
-          const [code, type] = (row[2] || "").split(" ");
-          userLastOtherCode[userEmail.toLowerCase()] = { code: code, type: type };
-        }
-      }
-    }
-  }
-  
-  for (let i = 1; i < adherenceData.length; i++) {
-    const row = adherenceData[i];
-    const rowDate = new Date(row[0]);
-    const rowDateStr = Utilities.formatDate(rowDate, timeZone, "MM/dd/yyyy");
-    
-    if (rowDateStr === targetDateStr) { 
-      const userName = row[1];
-      const userEmail = userData.nameToEmail[userName];
-      
-      if (userEmail && targetUserSet.has(userEmail.toLowerCase())) {
-        const lEmail = userEmail.toLowerCase();
-        
-        if (usersScheduledToday.has(lEmail)) {
-          const login = row[2], b1_in = row[3], b1_out = row[4], l_in = row[5],
-                l_out = row[6], b2_in = row[7], b2_out = row[8], logout = row[9];
-          
-          let agentStatus = "Pending Login";
-          if (login && !logout) {
-            agentStatus = "Logged In";
-            const lastOther = userLastOtherCode[lEmail];
-            
-            if (lastOther && lastOther.type === 'In') {
-              agentStatus = "On Break/Other";
-            } else {
-              if (b1_in && !b1_out) agentStatus = "On Break/Other";
-              if (l_in && !l_out) agentStatus = "On Break/Other";
-              if (b2_in && !b2_out) agentStatus = "On Break/Other";
-            }
-          } else if (login && logout) {
-            agentStatus = "Logged Out";
-          }
-          
-          userStatusMap[lEmail] = agentStatus;
-          usersScheduledToday.delete(lEmail);
-        }
-        
-        // 3. Sum Adherence Metrics
-        const tardy = parseFloat(row[10]) || 0;
-        const earlyLeave = parseFloat(row[12]) || 0;
-        const overtime = parseFloat(row[11]) || 0;
-        const breakExceed = (parseFloat(row[16]) || 0) + (parseFloat(row[18]) || 0);
-        const lunchExceed = parseFloat(row[17]) || 0;
+  const agentStatusList = [];
+  const processedAgents = new Set(); // Track who we found
 
-        totalAdherenceMetrics.totalTardy += tardy;
-        totalAdherenceMetrics.totalEarlyLeave += earlyLeave;
-        totalAdherenceMetrics.totalOvertime += overtime;
-        totalAdherenceMetrics.totalBreakExceed += breakExceed;
-        totalAdherenceMetrics.totalLunchExceed += lunchExceed;
-        
-        if (userMetricsMap[userName]) {
-          userMetricsMap[userName].tardy += tardy;
-          userMetricsMap[userName].earlyLeave += earlyLeave;
-          userMetricsMap[userName].overtime += overtime;
-          userMetricsMap[userName].breakExceed += breakExceed;
-          userMetricsMap[userName].lunchExceed += lunchExceed;
-        }
-      }
+  // Loop backwards to find the latest entry for each user
+  for (let i = adherenceData.length - 1; i > 0; i--) {
+    const row = adherenceData[i];
+    const rowDateStr = Utilities.formatDate(new Date(row[0]), timeZone, "MM/dd/yyyy");
+    const name = row[1];
+    const email = userData.nameToEmail[name]; // Map Name to Email
+    
+    if (rowDateStr === targetDateStr && email && targetUserSet.has(email) && !processedAgents.has(email)) {
+      
+      // Determine Current Status based on last filled column
+      // Columns: Login(2), B1In(3), B1Out(4), LIn(5), LOut(6), B2In(7), B2Out(8), Logout(9)
+      let currentStatus = "Logged Out";
+      let lastActionTime = null;
+      
+      if (row[9]) { currentStatus = "Logged Out"; lastActionTime = row[9]; }
+      else if (row[8]) { currentStatus = "Logged In"; lastActionTime = row[8]; } // Back from B2
+      else if (row[7]) { currentStatus = "On Last Break"; lastActionTime = row[7]; }
+      else if (row[6]) { currentStatus = "Logged In"; lastActionTime = row[6]; } // Back from Lunch
+      else if (row[5]) { currentStatus = "On Lunch"; lastActionTime = row[5]; }
+      else if (row[4]) { currentStatus = "Logged In"; lastActionTime = row[4]; } // Back from B1
+      else if (row[3]) { currentStatus = "On First Break"; lastActionTime = row[3]; }
+      else if (row[2]) { currentStatus = "Logged In"; lastActionTime = row[2]; }
+      
+      // Metrics for flags
+      let metrics = {
+        tardy: parseFloat(row[10]) || 0,
+        overtime: parseFloat(row[11]) || 0,
+        early: parseFloat(row[12]) || 0,
+        b1Exceed: parseFloat(row[16]) || 0,
+        lunchExceed: parseFloat(row[17]) || 0,
+        b2Exceed: parseFloat(row[18]) || 0
+      };
+
+      const sch = userScheduleMap[email] || { leaveType: "Day Off" };
+      
+      agentStatusList.push({
+        name: name,
+        email: email,
+        status: currentStatus,
+        // Convert Date object to numeric timestamp for client-side math
+        lastActionTime: lastActionTime instanceof Date ? lastActionTime.getTime() : null, 
+        schedule: sch,
+        metrics: metrics
+      });
+      
+      processedAgents.add(email);
     }
   }
-  
-  // 4. Get Pending Leave Requests
+
+  // --- 5. Handle Agents with No Adherence Record Yet ---
+  targetUserSet.forEach(email => {
+    if (!processedAgents.has(email)) {
+      const sch = userScheduleMap[email] || { leaveType: "Day Off" };
+      const name = userData.emailToName[email] || email;
+      
+      let status = "Logged Out";
+      if (sch.leaveType === "Present") status = "Pending Login";
+      else if (sch.leaveType && sch.leaveType !== "Day Off") status = sch.leaveType; // Sick, Annual, etc.
+
+      agentStatusList.push({
+        name: name,
+        email: email,
+        status: status,
+        lastActionTime: null,
+        schedule: sch,
+        metrics: { tardy:0, early:0, overtime:0, b1Exceed:0, lunchExceed:0, b2Exceed:0 }
+      });
+    }
+  });
+
+  // --- 6. Retrieve Pending Leave Requests (Summary for Dashboard) ---
   const reqSheet = getOrCreateSheet(ss, SHEET_NAMES.leaveRequests);
   const reqData = reqSheet.getDataRange().getValues();
   const pendingRequests = [];
@@ -3119,31 +3093,26 @@ function getDashboardData(adminEmail, userEmails, date) {
     if (row[1] && row[1].toString().trim().toLowerCase() === 'pending' && targetUserSet.has(reqEmail)) {
       try {
         pendingRequests.push({
-          name: row[3], type: row[4], 
-          startDate: convertDateToString(new Date(row[5])), days: row[7] 
+          name: row[3], 
+          type: row[4], 
+          startDate: convertDateToString(new Date(row[5])), 
+          days: row[7] 
         });
       } catch (e) {
-        Logger.log(`Failed to parse pending request row ${i+1}. Error: ${e.message}`);
+        Logger.log(`Failed to parse pending request row ${i+1}: ${e.message}`);
       }
     }
   }
-  
-  const agentStatusList = [];
-  for (const email of targetUserSet) {
-      const name = userData.emailToName[email] || email;
-      // *** MODIFIED for Request 3: Fallback is now "Day Off" ***
-      const status = userStatusMap[email] || "Day Off";
-      agentStatusList.push({ name: name, status: status });
-  }
-  agentStatusList.sort((a, b) => a.name.localeCompare(b.name));
-  
-  const individualAdherenceMetrics = Object.values(userMetricsMap);
-  
+
+  // Final Sort by Name
+  agentStatusList.sort((a,b) => a.name.localeCompare(b.name));
+
+  // Return composite object
   return {
     agentStatusList: agentStatusList,
-    totalAdherenceMetrics: totalAdherenceMetrics,
-    individualAdherenceMetrics: individualAdherenceMetrics,
-    pendingRequests: pendingRequests
+    pendingRequests: pendingRequests,
+    breakRules: breakRules, // Send config to frontend for live validation
+    totalAdherenceMetrics: { /* Calculated on frontend or unused in new design */ } 
   };
 }
 
@@ -5651,6 +5620,52 @@ function webActionOvertime(reqId, action, comment, preApproveData) {
   return `Request ${action}.`;
 }
 
+/**
+ * ADMIN: Save Break Rules
+ */
+function webSaveBreakConfig(newRules) {
+  const { ss } = getAuthorizedContext('MANAGE_TEMPLATES'); // Reusing Template permission or create MANAGE_WFM
+  const sheet = getOrCreateSheet(ss, SHEET_NAMES.breakRules);
+  
+  // Clear existing (except header)
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2, 1, sheet.getLastRow()-1, 6).clearContent();
+  }
+  
+  const rows = newRules.map(r => [
+    r.id || `BRK-${new Date().getTime()}`,
+    r.project,
+    r.type,
+    r.duration,
+    r.isPaid,
+    r.deduct
+  ]);
+  
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, 6).setValues(rows);
+  }
+  
+  return "Break rules updated.";
+}
+
+function webGetBreakConfig() {
+  const ss = getSpreadsheet();
+  const sheet = getOrCreateSheet(ss, SHEET_NAMES.breakRules);
+  const data = sheet.getDataRange().getValues();
+  const rules = [];
+  for(let i=1; i<data.length; i++) {
+    rules.push({
+      id: data[i][0],
+      project: data[i][1],
+      type: data[i][2],
+      duration: data[i][3],
+      isPaid: data[i][4],
+      deduct: data[i][5]
+    });
+  }
+  return rules;
+}
+
 
 
 
@@ -5677,8 +5692,14 @@ function _MASTER_DB_FIXER() {
     [SHEET_NAMES.requisitions]: ["ReqID", "Title", "Department", "HiringManager", "OpenDate", "Status", "PoolCandidates", "JobDescription"],
     [SHEET_NAMES.performance]: ["ReviewID", "EmployeeID", "Year", "ReviewPeriod", "Rating", "ManagerComments", "Date"],
     [SHEET_NAMES.historyLogs]: ["HistoryID", "EmployeeID", "Date", "EventType", "OldValue", "NewValue"],
-    [SHEET_NAMES.adherence]: ["Date", "User Name", "Login", "First Break In", "First Break Out", "Lunch In", "Lunch Out", "Last Break In", "Last Break Out", "Logout", "Tardy (Seconds)", "Overtime (Seconds)", "Early Leave (Seconds)", "Leave Type", "Admin Audit", "—", "1st Break Exceed", "Lunch Exceed", "Last Break Exceed", "Absent", "Admin Code"],
-    [SHEET_NAMES.schedule]: ["Name", "StartDate", "ShiftStartTime", "EndDate", "ShiftEndTime", "LeaveType", "agent email"],
+    // NEW: Dynamic Break Rules
+    [SHEET_NAMES.breakRules]: ["RuleID", "ProjectID", "BreakType", "DurationMinutes", "IsPaid", "DeductFromLogin"],
+    
+    // MODIFIED: Schedule now supports specific windows
+    [SHEET_NAMES.schedule]: ["Name", "StartDate", "ShiftStartTime", "EndDate", "ShiftEndTime", "LeaveType", "agent email", "Break1_Start", "Break1_End", "Lunch_Start", "Lunch_End", "Break2_Start", "Break2_End"],
+    
+    // MODIFIED: Adherence to track Net Hours
+    [SHEET_NAMES.adherence]: ["Date", "User Name", "Login", "First Break In", "First Break Out", "Lunch In", "Lunch Out", "Last Break In", "Last Break Out", "Logout", "Tardy (Seconds)", "Overtime (Seconds)", "Early Leave (Seconds)", "Leave Type", "Admin Audit", "Net_Login_Hours", "1st Break Exceed", "Lunch Exceed", "Last Break Exceed", "Absent", "Admin Code"],
     [SHEET_NAMES.logs]: ["Timestamp", "User Name", "Email", "Action", "Time"],
     [SHEET_NAMES.otherCodes]: ["Date", "User Name", "Code", "Time In", "Time Out", "Duration (Seconds)", "Admin Audit (Email)"],
     [SHEET_NAMES.warnings]: ["WarningID", "EmployeeID", "Type", "Level", "Date", "Description", "Status", "IssuedBy"],
@@ -5695,13 +5716,12 @@ function _MASTER_DB_FIXER() {
     [SHEET_NAMES.overtime]: ["RequestID", "EmployeeID", "EmployeeName", "ShiftDate", "PlannedStart", "PlannedEnd", "RequestedHours", "Reason", "Status", "ManagerComment", "ActionBy", "ActionDate"]
   };
 
-  // 2. Run Fixer
+// Run Fixer Logic
   for (const [sheetName, headers] of Object.entries(schema)) {
     let sheet = getOrCreateSheet(ss, sheetName);
     const lastCol = sheet.getLastColumn();
     let currentHeaders = [];
     
-    // Only fetch headers if the sheet is not empty
     if (lastCol > 0) {
       currentHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
     }
@@ -5710,11 +5730,18 @@ function _MASTER_DB_FIXER() {
     headers.forEach(h => { if (!currentHeaders.includes(h)) missingCols.push(h); });
 
     if (missingCols.length > 0) {
-      // Append to the next available column (startCol = 1 if empty, else lastCol + 1)
       const startCol = lastCol === 0 ? 1 : lastCol + 1;
       sheet.getRange(1, startCol, 1, missingCols.length).setValues([missingCols]);
       Logger.log(`Updated ${sheetName}: Added [${missingCols.join(', ')}]`);
     }
+  }
+  
+  // Populate Default Break Rules if empty
+  const ruleSheet = ss.getSheetByName(SHEET_NAMES.breakRules);
+  if (ruleSheet.getLastRow() === 1) {
+    ruleSheet.appendRow(["BRK-001", "All", "First Break", 15, "TRUE", "FALSE"]);
+    ruleSheet.appendRow(["BRK-002", "All", "Lunch", 30, "FALSE", "TRUE"]); // Unpaid = Deduct
+    ruleSheet.appendRow(["BRK-003", "All", "Last Break", 15, "TRUE", "FALSE"]);
   }
 
   // 3. Populate Permissions (RBAC)
