@@ -5665,96 +5665,272 @@ function webGetPendingDataChanges() {
 
 
 // ==========================================
-// === PHASE 8: OVERTIME MANAGEMENT API ===
+// === PHASE 5: OVERTIME & DAY OFF SYSTEM (Double Approval) ===
 // ==========================================
 
 /**
- * AGENT: Request Overtime
+ * SUBMIT: Agent Request OR Manager Assignment
  */
 function webSubmitOvertimeRequest(requestData) {
-  const { userEmail, userData, ss } = getAuthorizedContext(null);
+  const { userEmail: submitterEmail, userData, ss } = getAuthorizedContext(null);
   const otSheet = getOrCreateSheet(ss, SHEET_NAMES.overtime);
   
-  const shiftDate = new Date(requestData.date);
+  // 1. Determine Target User (Agent vs Manager Assignment)
+  let targetEmail = submitterEmail;
+  let initiatedBy = "Agent";
   
-  // 1. Validate Schedule
-  const schedule = getScheduleForDate(userEmail, shiftDate);
-  if (!schedule || !schedule.end) {
-    throw new Error("No schedule found for this date. Cannot request overtime.");
+  // If a manager is assigning to someone else
+  if (requestData.targetEmail && requestData.targetEmail !== submitterEmail) {
+      // Check permission
+      const { userRole } = getAuthorizedContext('MANAGE_OVERTIME'); // Ensure they are a manager
+      targetEmail = requestData.targetEmail;
+      initiatedBy = `Manager (${userData.userName})`;
   }
 
-  const reqID = `OT-${new Date().getTime()}`;
+  const targetUser = userData.userList.find(u => u.email === targetEmail);
+  if (!targetUser) throw new Error("Target user not found.");
+
+  // 2. Schedule Validation
+  const shiftDate = new Date(requestData.date);
+  const schedule = getScheduleForDate(targetEmail, shiftDate);
+  const type = requestData.type;
+
+  if (type === "Work Day Off") {
+      if (schedule && schedule.start && schedule.leaveType !== 'Day Off' && schedule.leaveType !== 'Absent') {
+          throw new Error(`User already has a shift on ${requestData.date}. Use Pre/Post Shift.`);
+      }
+  } else {
+      if (!schedule || !schedule.end) {
+          throw new Error(`No active schedule found for ${targetUser.name} on this date.`);
+      }
+  }
+
+  // 3. Time Validation
+  const otStartObj = createDateTime(shiftDate, requestData.startTime);
+  let otEndObj = createDateTime(shiftDate, requestData.endTime);
+  if (otEndObj < otStartObj) otEndObj.setDate(otEndObj.getDate() + 1); // Overnight
   
+  const duration = (otEndObj - otStartObj) / (1000 * 60 * 60);
+  if (duration <= 0) throw new Error("Invalid time range.");
+
+  // 4. Determine Approval Flow
+  const directMgr = targetUser.supervisor;
+  const projectMgr = targetUser.projectManager;
+  
+  let directStatus = "Pending";
+  let projectStatus = "Pending";
+  let overallStatus = "Pending Direct Mgr";
+
+  // Auto-approve if the submitter IS one of the managers
+  if (submitterEmail === directMgr) {
+      directStatus = "Approved";
+      overallStatus = "Pending Project Mgr";
+  }
+  if (submitterEmail === projectMgr) {
+      projectStatus = "Approved";
+      // If Direct is still pending, it stays "Pending Direct". 
+      // If Direct was already approved (unlikely in this flow), it moves to Approved.
+  }
+  
+  // Edge Case: If submitter is Superadmin, approve ALL
+  if (userData.userRole === 'superadmin') {
+      directStatus = "Approved";
+      projectStatus = "Approved";
+      overallStatus = "Approved";
+  }
+
+  // 5. Save Request
+  const reqID = `OT-${new Date().getTime()}`;
   otSheet.appendRow([
     reqID,
-    userData.userList.find(u=>u.email === userEmail)?.empID || "",
-    userData.userName,
+    targetUser.empID,
+    targetUser.name,
     shiftDate,
-    new Date(schedule.start),
-    new Date(schedule.end),
-    requestData.hours,
+    otStartObj,
+    otEndObj,
+    duration.toFixed(2),
     requestData.reason,
-    "Pending",
-    "", // Manager Comment
-    "", // Action By
-    ""  // Action Date
+    overallStatus, // Status
+    "",            // Comment
+    "",            // ActionBy
+    "",            // ActionDate
+    type,
+    directMgr,     // Col N
+    projectMgr,    // Col O
+    directStatus,  // Col P
+    projectStatus, // Col Q
+    initiatedBy    // Col R
   ]);
-  
-  return "Overtime request submitted.";
+
+  // If Superadmin auto-approved, trigger schedule update immediately
+  if (overallStatus === 'Approved') {
+      finalizeOvertimeSchedule(ss, targetUser, requestData, submitterEmail);
+  }
+
+  return "Request submitted successfully.";
 }
 
 /**
- * MANAGER: Get Overtime Requests (Pending or All)
+ * ACTION: Manager Approves/Denies
  */
+function webActionOvertime(reqId, action, comment) {
+  const { userEmail: adminEmail, ss, userData } = getAuthorizedContext('MANAGE_OVERTIME');
+  const otSheet = getOrCreateSheet(ss, SHEET_NAMES.overtime);
+  
+  const data = otSheet.getDataRange().getValues();
+  let rowIdx = -1;
+  let reqRow = [];
+
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] === reqId) {
+      rowIdx = i + 1;
+      reqRow = data[i];
+      break;
+    }
+  }
+  if (rowIdx === -1) throw new Error("Request not found.");
+
+  const targetEmail = userData.userList.find(u => u.empID === reqRow[1])?.email;
+  const directMgr = reqRow[13];
+  const projectMgr = reqRow[14];
+  
+  // 1. Identify Role of Approver
+  let isDirect = (adminEmail === directMgr);
+  let isProject = (adminEmail === projectMgr);
+  let isSuper = (userData.userRole === 'superadmin');
+
+  if (!isDirect && !isProject && !isSuper) {
+      throw new Error("You are not authorized to approve this request.");
+  }
+
+  // 2. Handle DENY
+  if (action === 'Denied') {
+      otSheet.getRange(rowIdx, 9).setValue("Denied");
+      otSheet.getRange(rowIdx, 10).setValue(comment);
+      otSheet.getRange(rowIdx, 11).setValue(adminEmail);
+      otSheet.getRange(rowIdx, 12).setValue(new Date());
+      return "Request Denied.";
+  }
+
+  // 3. Handle APPROVE
+  let newStatus = reqRow[8]; // Current Status
+  
+  if (isDirect || isSuper) {
+      otSheet.getRange(rowIdx, 16).setValue("Approved"); // DirectStatus
+  }
+  if (isProject || isSuper) {
+      otSheet.getRange(rowIdx, 17).setValue("Approved"); // ProjectStatus
+  }
+
+  // Re-read statuses to determine next step
+  const dStat = (isDirect || isSuper) ? "Approved" : reqRow[15];
+  const pStat = (isProject || isSuper) ? "Approved" : reqRow[16];
+
+  if (dStat === 'Approved' && pStat === 'Pending') {
+      newStatus = "Pending Project Mgr";
+  } else if (dStat === 'Approved' && pStat === 'Approved') {
+      newStatus = "Approved";
+  }
+
+  // Update Main Status
+  otSheet.getRange(rowIdx, 9).setValue(newStatus);
+  otSheet.getRange(rowIdx, 11).setValue(adminEmail); // Last Action By
+  otSheet.getRange(rowIdx, 12).setValue(new Date());
+
+  // 4. Finalize if Fully Approved
+  if (newStatus === "Approved") {
+      const requestData = {
+          date: reqRow[3],
+          type: reqRow[12],
+          startTime: reqRow[4], // Date Obj
+          endTime: reqRow[5],   // Date Obj
+          name: reqRow[2]
+      };
+      
+      const targetUserObj = userData.userList.find(u => u.empID === reqRow[1]);
+      finalizeOvertimeSchedule(ss, targetUserObj, requestData, adminEmail);
+      return "Request Finalized. Schedule Updated.";
+  }
+
+  return "Approval Recorded. Waiting for next approver.";
+}
+
+
+// Helper: Updates Schedule
+function finalizeOvertimeSchedule(ss, targetUser, reqData, adminEmail) {
+    const scheduleSheet = getOrCreateSheet(ss, SHEET_NAMES.schedule);
+    const logsSheet = getOrCreateSheet(ss, SHEET_NAMES.logs);
+    const targetDateStr = Utilities.formatDate(new Date(reqData.date), Session.getScriptTimeZone(), "MM/dd/yyyy");
+
+    const formatT = (d) => Utilities.formatDate(new Date(d), Session.getScriptTimeZone(), "HH:mm");
+
+    if (reqData.type === 'Work Day Off') {
+        updateOrAddSingleSchedule(
+            scheduleSheet, {}, logsSheet,
+            targetUser.email, targetUser.name,
+            new Date(reqData.date), new Date(reqData.date),
+            targetDateStr,
+            formatT(reqData.startTime), formatT(reqData.endTime),
+            "Work Day Off", adminEmail
+        );
+    } else {
+        // Pre/Post Shift: Extend Schedule
+        const curSched = getScheduleForDate(targetUser.email, new Date(reqData.date));
+        if (curSched) {
+            let s = curSched.start;
+            let e = curSched.end;
+            if (reqData.type === 'Pre-Shift') s = formatT(reqData.startTime);
+            if (reqData.type === 'Post-Shift') e = formatT(reqData.endTime);
+            
+            updateOrAddSingleSchedule(
+                scheduleSheet, {}, logsSheet,
+                targetUser.email, targetUser.name,
+                new Date(reqData.date), new Date(reqData.date),
+                targetDateStr,
+                s, e, "Present", adminEmail
+            );
+        }
+    }
+}
+
+// Helper: Fetch List with Details
 function webGetOvertimeRequests(filterStatus) {
-  const { userEmail, userData, ss } = getAuthorizedContext(null); // Check logic inside
+  const { userEmail, userData, ss } = getAuthorizedContext(null);
   const otSheet = getOrCreateSheet(ss, SHEET_NAMES.overtime);
   const data = otSheet.getDataRange().getValues();
-  
   const results = [];
-  // Col Indexes: 0:ID, 1:EmpID, 2:Name, 3:Date, 4:Start, 5:End, 6:Hours, 7:Reason, 8:Status
   
-  // Permissions check
-  const isManager = (userData.userRole === 'manager' || userData.userRole === 'admin' || userData.userRole === 'superadmin');
-  const mySubordinates = isManager ? new Set(webGetAllSubordinateEmails(userEmail)) : new Set();
+  const isManager = ['admin','superadmin','manager','project_manager'].includes(userData.userRole);
+  const mySubs = isManager ? new Set(webGetAllSubordinateEmails(userEmail)) : new Set();
 
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    const status = row[8];
-    const empName = row[2]; // We don't store email in OT sheet? We should have.
-    // Fix: I missed storing Email in webSubmitOvertimeRequest. 
-    // Let's assume we filter by Name match or add Email column. 
-    // Ideally, adding Email column is best. 
-    // For now, let's match strictly by hierarchy if manager, or self if agent.
+    // Security: View Own OR Subordinates
+    const ownerID = row[1];
+    const ownerUser = userData.userList.find(u => u.empID === ownerID);
+    const ownerEmail = ownerUser ? ownerUser.email : "";
     
-    // To make it robust, let's fix the appendRow in webSubmitOvertimeRequest first?
-    // Actually, let's just fetch the EmpID and look up the email from userData.
-    const empID = row[1];
-    const userObj = userData.userList.find(u => u.empID === empID);
-    const rowEmail = userObj ? userObj.email : "";
-
-    let canView = false;
-    
-    if (isManager) {
-      if (userData.userRole === 'superadmin') canView = true;
-      else if (mySubordinates.has(rowEmail)) canView = true;
-    } else {
-      if (rowEmail === userEmail) canView = true; // Agent sees own
+    let canView = (ownerEmail === userEmail);
+    if (!canView && isManager && (userData.userRole === 'superadmin' || mySubs.has(ownerEmail))) {
+        canView = true;
     }
 
     if (canView) {
-      if (filterStatus === 'All' || status === filterStatus) {
-        results.push({
-          id: row[0],
-          name: row[2],
-          date: convertDateToString(new Date(row[3])).split('T')[0],
-          plannedEnd: row[5] ? Utilities.formatDate(new Date(row[5]), Session.getScriptTimeZone(), "HH:mm") : "N/A",
-          hours: row[6],
-          reason: row[7],
-          status: status,
-          comment: row[9]
-        });
-      }
+        if (filterStatus === 'All' || row[8] === filterStatus || (filterStatus === 'Pending' && row[8].includes('Pending'))) {
+            results.push({
+                id: row[0],
+                name: row[2],
+                date: convertDateToString(new Date(row[3])).split('T')[0],
+                time: `${Utilities.formatDate(new Date(row[4]), Session.getScriptTimeZone(), "HH:mm")} - ${Utilities.formatDate(new Date(row[5]), Session.getScriptTimeZone(), "HH:mm")}`,
+                hours: row[6],
+                reason: row[7],
+                status: row[8],
+                type: row[12],
+                initiatedBy: row[17],
+                directStatus: row[15],
+                projectStatus: row[16]
+            });
+        }
     }
   }
   return results.reverse();
@@ -5931,7 +6107,7 @@ function _MASTER_DB_FIXER() {
     [SHEET_NAMES.projectLogs]: ["LogID", "EmployeeID", "ProjectID", "Date", "HoursLogged"],
     [SHEET_NAMES.announcements]: ["AnnouncementID", "Content", "Status", "CreatedByEmail", "Timestamp"],
     [SHEET_NAMES.assets]: ["AssetID", "Type", "AssignedTo_EmployeeID", "DateAssigned", "Status"],
-    [SHEET_NAMES.overtime]: ["RequestID", "EmployeeID", "EmployeeName", "ShiftDate", "PlannedStart", "PlannedEnd", "RequestedHours", "Reason", "Status", "ManagerComment", "ActionBy", "ActionDate"]
+    [SHEET_NAMES.overtime]: ["RequestID", "EmployeeID", "EmployeeName", "ShiftDate", "PlannedStart", "PlannedEnd", "RequestedHours", "Reason","Status", "ManagerComment", "ActionBy", "ActionDate", "Type","DirectManager", "ProjectManager", "DirectStatus", "ProjectStatus", "InitiatedBy"]
   };
 
   // 2. Run Fixer
