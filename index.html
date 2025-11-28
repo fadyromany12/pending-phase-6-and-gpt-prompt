@@ -2491,70 +2491,54 @@ body.dark-mode .status-offline { background-color: #374151; color: #9ca3af; }
 
 
 <div id="overtime-panel" class="tab-panel">
-  <h2>Overtime Management</h2>
+  <h2>Overtime & Day Off Management</h2>
   
-  <div id="ot-manager-section" style="display:none; margin-bottom: 20px; padding: 20px; background: var(--input-bg); border-radius: 8px;">
-    <h3 style="margin-top:0; color: var(--konecta-blue);">Pre-Approve Overtime</h3>
-    <div class="form-row">
-      <div class="form-group">
-        <label>Select Employee</label>
-        <div id="ot-employee-select-container"></div>
-      </div>
-      <div class="form-group">
-        <label>Date</label>
-        <input type="date" id="ot-pre-date">
-      </div>
-    </div>
-    <div class="form-row">
-      <div class="form-group">
-        <label>Hours Allowed</label>
-        <input type="number" id="ot-pre-hours" step="0.5" placeholder="e.g. 2">
-      </div>
-      <div class="form-group">
-        <label>Comment</label>
-        <input type="text" id="ot-pre-comment" placeholder="Project requirement...">
-      </div>
-    </div>
-    <button class="btn-primary" onclick="submitPreApproval()">Pre-Approve</button>
-  </div>
-
   <div class="form-container">
-    <h3>Request Overtime</h3>
+    <div style="display:flex; justify-content:space-between;">
+        <h3>Request / Assign Hours</h3>
+        <div id="ot-assign-toggle" style="display:none;">
+            <label><input type="checkbox" id="ot-is-assignment" onchange="toggleOtAssignment()"> Assign to Agent</label>
+        </div>
+    </div>
+
+    <div id="ot-employee-select-wrapper" style="display:none; margin-bottom:15px; padding:10px; background:#f3f4f6; border-radius:6px;">
+        
+        <div id="ot-employee-select-container"></div>
+    </div>
+
     <div class="form-row">
+      <div class="form-group"><label>Date</label><input type="date" id="ot-req-date"></div>
       <div class="form-group">
-        <label>Date</label>
-        <input type="date" id="ot-req-date">
-      </div>
-      <div class="form-group">
-        <label>Requested Hours</label>
-        <input type="number" id="ot-req-hours" step="0.5">
+        <label>Type</label>
+        <select id="ot-req-type">
+          <option value="Post-Shift">Post-Shift (Stay Late)</option>
+          <option value="Pre-Shift">Pre-Shift (Come Early)</option>
+          <option value="Work Day Off">Work Day Off (Cancel Off)</option>
+        </select>
       </div>
     </div>
-    <div class="form-group">
-      <label>Reason</label>
-      <input type="text" id="ot-req-reason" placeholder="Why is overtime needed?">
+    
+    <div class="form-row">
+      <div class="form-group"><label>Start</label><input type="time" id="ot-req-start"></div>
+      <div class="form-group"><label>End</label><input type="time" id="ot-req-end"></div>
     </div>
-    <button class="btn-primary" onclick="submitOtRequest()">Submit Request</button>
+
+    <div class="form-group"><label>Reason</label><input type="text" id="ot-req-reason" placeholder="Reason..."></div>
+    <button class="btn-primary" onclick="submitOtRequest()">Submit</button>
     <div id="ot-status" class="status-message"></div>
   </div>
 
   <hr class="section-divider">
 
   <div style="display: flex; justify-content: space-between; align-items: center;">
-    <h3>Overtime Requests</h3>
-    <div class="form-group" style="margin: 0; width: 150px;">
-        <select id="ot-filter-status" onchange="loadOvertimeRequests()">
-            <option value="Pending">Pending</option>
-            <option value="Approved">Approved</option>
-            <option value="Denied">Denied</option>
-            <option value="All">All</option>
-        </select>
-    </div>
+    <h3>History & Approvals</h3>
+    <select id="ot-filter-status" onchange="loadOvertimeRequests()" style="padding:5px;">
+        <option value="Pending">Pending Actions</option>
+        <option value="Approved">Approved</option>
+        <option value="All">All History</option>
+    </select>
   </div>
-  
-  <div id="ot-request-list" class="request-list">
-    <p class="text-color-secondary">Loading...</p>
-  </div>
+  <div id="ot-request-list" class="request-list"></div>
 </div>
         
       </main> <!-- End #app-content -->
@@ -7557,43 +7541,48 @@ function submitHrOffboarding() {
 // --- OVERTIME FUNCTIONS ---
 
 function loadOvertimeTab() {
-  // 1. Setup User Info
   document.getElementById('ot-req-date').valueAsDate = new Date();
   
-  // 2. Show Manager Section if Permitted
-  if (selfRole === 'admin' || selfRole === 'superadmin' || selfRole === 'manager' || selfRole === 'project_manager') {
-    document.getElementById('ot-manager-section').style.display = 'block';
-    document.getElementById('ot-pre-date').valueAsDate = new Date();
-    populateAdminDropdown(allUsersList, selfUserName, 'ot-employee-select', 'Select Employee');
-  } else {
-    document.getElementById('ot-manager-section').style.display = 'none';
+  // Show assignment toggle for managers
+  if (['admin','superadmin','manager','project_manager'].includes(selfRole)) {
+      document.getElementById('ot-assign-toggle').style.display = 'block';
+      populateAdminDropdown(allUsersList, selfUserName, 'ot-employee-select', 'Select Agent');
   }
-
-  // 3. Load List
   loadOvertimeRequests();
 }
 
+function toggleOtAssignment() {
+    const isAssign = document.getElementById('ot-is-assignment').checked;
+    document.getElementById('ot-employee-select-wrapper').style.display = isAssign ? 'block' : 'none';
+}
+
+
 function submitOtRequest() {
-  const data = {
-    date: document.getElementById('ot-req-date').value,
-    hours: document.getElementById('ot-req-hours').value,
-    reason: document.getElementById('ot-req-reason').value
-  };
-  
-  if (!data.date || !data.hours || !data.reason) {
-    setStatus('ot-status', 'error', 'All fields are required.');
-    return;
+  const isAssignment = document.getElementById('ot-is-assignment').checked;
+  const targetEmail = isAssignment ? document.getElementById('ot-employee-select').value : null;
+
+  if (isAssignment && !targetEmail) {
+      setStatus('ot-status', 'error', 'Please select an agent.');
+      return;
   }
 
+  const data = {
+    targetEmail: targetEmail, // Null if self-request
+    date: document.getElementById('ot-req-date').value,
+    type: document.getElementById('ot-req-type').value,
+    startTime: document.getElementById('ot-req-start').value,
+    endTime: document.getElementById('ot-req-end').value,
+    reason: document.getElementById('ot-req-reason').value
+  };
+
   setStatus('ot-status', 'processing', 'Submitting...');
-  google.script.run
-    .withSuccessHandler(msg => {
+  google.script.run.withSuccessHandler(msg => {
       setStatus('ot-status', 'success', msg);
       loadOvertimeRequests();
-    })
-    .withFailureHandler(err => setStatus('ot-status', 'error', err.message))
-    .webSubmitOvertimeRequest(data);
+  }).withFailureHandler(err => setStatus('ot-status', 'error', err.message))
+  .webSubmitOvertimeRequest(data);
 }
+
 
 function submitPreApproval() {
   const data = {
@@ -7620,63 +7609,62 @@ function submitPreApproval() {
 function loadOvertimeRequests() {
   const filter = document.getElementById('ot-filter-status').value;
   const list = document.getElementById('ot-request-list');
-  list.innerHTML = '<p class="text-color-secondary">Loading...</p>';
+  list.innerHTML = 'Loading...';
 
-  google.script.run
-    .withSuccessHandler(reqs => {
-      if (reqs.length === 0) {
-        list.innerHTML = '<p class="text-color-secondary">No requests found.</p>';
-        return;
-      }
+  google.script.run.withSuccessHandler(reqs => {
+      if(reqs.length === 0) { list.innerHTML = 'No records found.'; return; }
       
       let html = '';
       reqs.forEach(r => {
-        let statusBadge = `status-pending`;
-        if (r.status === 'Approved') statusBadge = 'status-approved';
-        if (r.status === 'Denied') statusBadge = 'status-denied';
+          // Action Buttons Logic
+          let actions = '';
+          const isPending = r.status.includes('Pending');
+          if (isPending && ['admin','superadmin','manager','project_manager'].includes(selfRole)) {
+              actions = `
+                <div style="margin-top:5px;">
+                   <button class="approve-btn" onclick="actionOvertime('${r.id}','Approved')">Approve</button>
+                   <button class="deny-btn" onclick="actionOvertime('${r.id}','Denied')">Deny</button>
+                </div>`;
+          }
 
-        // Manager Actions
-        let actions = '';
-        if (r.status === 'Pending' && (selfRole === 'admin' || selfRole === 'manager' || selfRole === 'superadmin' || selfRole === 'project_manager')) {
-          actions = `
-            <div style="margin-top: 10px;">
-              <button class="approve-btn" onclick="actionOvertime('${r.id}', 'Approved')">Approve</button>
-              <button class="deny-btn" onclick="actionOvertime('${r.id}', 'Denied')">Deny</button>
-            </div>
-          `;
-        }
-
-        html += `
-          <div class="request-list-item">
-            <div class="item-details">
-              <h4>${r.name} <span class="text-color-secondary">(${r.hours} hrs)</span></h4>
-              <p><strong>Date:</strong> ${r.date}</p>
-              <p><strong>Planned Shift End:</strong> ${r.plannedEnd}</p>
-              <p><strong>Reason:</strong> ${r.reason}</p>
-              ${r.comment ? `<p class="text-color-secondary"><em>Note: ${r.comment}</em></p>` : ''}
-            </div>
-            <div class="item-actions">
-              <span class="status-badge ${statusBadge}">${r.status}</span>
-              ${actions}
-            </div>
-          </div>
-        `;
+          html += `
+            <div class="request-list-item">
+                <div class="item-details">
+                    <h4>${r.name} <span class="status-tag status-info">${r.type}</span></h4>
+                    <p><strong>Date:</strong> ${r.date} | <strong>Time:</strong> ${r.time} (${r.hours} hrs)</p>
+                    <p class="text-color-secondary">Initiated By: ${r.initiatedBy}</p>
+                    <p style="font-size:0.85rem;">
+                        Direct: <strong>${r.directStatus}</strong> | Project: <strong>${r.projectStatus}</strong>
+                    </p>
+                </div>
+                <div class="item-actions">
+                    <span class="status-badge ${r.status==='Approved'?'status-approved':r.status==='Denied'?'status-denied':'status-pending'}">${r.status}</span>
+                    ${actions}
+                </div>
+            </div>`;
       });
       list.innerHTML = html;
-    })
-    .withFailureHandler(err => list.innerHTML = `<p class="error">${err.message}</p>`)
-    .webGetOvertimeRequests(filter);
+  }).webGetOvertimeRequests(filter);
 }
 
 function actionOvertime(id, action) {
-  const comment = prompt(`Reason for ${action}:`) || "";
+  const comment = prompt(`Optional comment for ${action}:`) || "";
+  
+  // Visual feedback
+  const list = document.getElementById('ot-request-list');
+  list.style.opacity = '0.5';
+
   google.script.run
     .withSuccessHandler(msg => {
       alert(msg);
+      list.style.opacity = '1';
       loadOvertimeRequests();
     })
-    .withFailureHandler(err => alert(err.message))
-    .webActionOvertime(id, action, comment, null);
+    .withFailureHandler(err => {
+        list.style.opacity = '1';
+        alert("Error: " + err.message);
+    })
+    .webActionOvertime(id, action, comment);
 }
 
 // --- PHASE 6: BREAK CONFIG EDITOR JS ---
