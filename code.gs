@@ -1177,15 +1177,34 @@ function getUserInfo() {
     let isNewUser = false; 
     const KONECTA_DOMAIN = "@konecta.com"; 
     
-    if (!userData.emailToName[userEmail] && userEmail.endsWith(KONECTA_DOMAIN)) {
+    // FIX: Robust check to prevent duplicates on refresh
+    // 1. Check our loaded data
+    let userExists = userData.emailToName[userEmail] !== undefined;
+
+    // 2. If not found in data, do a DIRECT SHEET CHECK to be absolutely sure
+    // (This handles cases where the helper might miss a recently added row)
+    if (!userExists && userEmail.endsWith(KONECTA_DOMAIN)) {
+      const emailColumn = dbSheet.getRange("C:C").getValues(); // Column C is Email
+      for (let i = 0; i < emailColumn.length; i++) {
+        if (String(emailColumn[i][0]).trim().toLowerCase() === userEmail) {
+          userExists = true;
+          break;
+        }
+      }
+    }
+
+    // Only append if they TRULY do not exist
+    if (!userExists && userEmail.endsWith(KONECTA_DOMAIN)) {
       isNewUser = true;
       const nameParts = userEmail.split('@')[0].split('.');
       const firstName = nameParts[0] ? nameParts[0].charAt(0).toUpperCase() + nameParts[0].slice(1) : '';
       const lastName = nameParts[1] ? nameParts[1].charAt(0).toUpperCase() + nameParts[1].slice(1) : '';
       const newName = [firstName, lastName].join(' ').trim();
       const newEmpID = "KOM-PENDING-" + new Date().getTime();
+      
       dbSheet.appendRow([newEmpID, newName || userEmail, userEmail, 'agent', 'Pending', "", "", 0, 0, 0, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "Pending"]);
       SpreadsheetApp.flush(); 
+      // Refresh user data after append
       userData = getUserDataFromDb(ss);
     }
     
@@ -1203,6 +1222,7 @@ function getUserInfo() {
 
     let allUsers = [];
     let allAdmins = [];
+    // Only show full user list to non-agents, OR new users (to select managers), OR pending users
     if (role !== 'agent' || isNewUser || accountStatus === 'Pending') { 
       allUsers = userData.userList;
     }
@@ -1243,7 +1263,7 @@ function getUserInfo() {
       hasPendingRoleRequests: hasPendingRoleRequests, 
       currentStatus: currentStatus,
       permissions: myPermissions,
-      breakRules: breakRules // <--- Sending to frontend
+      breakRules: breakRules 
     };
   } catch (e) { throw new Error("Failed in getUserInfo: " + e.message); }
 }
@@ -3430,13 +3450,12 @@ function activateUser(ss, regRow, hiringDateStr) {
   const funcMgr = regRow[4];
   const address = regRow[7];
   const phone = regRow[8];
-  
+
   // Update Core & PII
   const coreSheet = getOrCreateSheet(ss, SHEET_NAMES.employeesCore);
   const piiSheet = getOrCreateSheet(ss, SHEET_NAMES.employeesPII);
-  
+
   // 1. Find user in Core (created during auto-registration in getUserInfo)
-  // Or if they don't exist, append. But usually they exist as "Pending".
   const coreData = coreSheet.getDataRange().getValues();
   let coreRow = -1;
   for(let i=1; i<coreData.length; i++) {
@@ -3447,16 +3466,24 @@ function activateUser(ss, regRow, hiringDateStr) {
   }
   
   if (coreRow === -1) throw new Error("User record missing in Core DB.");
+
+  // --- FIX: CHECK AND UPDATE EMPLOYEE ID IF PENDING ---
+  let empID = coreSheet.getRange(coreRow, 1).getValue();
   
+  if (String(empID).includes("PENDING")) {
+    const newEmpID = generateNextEmpID(coreSheet);
+    coreSheet.getRange(coreRow, 1).setValue(newEmpID); // Update ID in Core
+    empID = newEmpID; // Use new ID for subsequent steps
+    Logger.log(`Updated user ${userName} from PENDING ID to ${newEmpID}`);
+  }
+  // ----------------------------------------------------
+
   // Update Core: Status, Managers
   coreSheet.getRange(coreRow, 5).setValue("Active"); // Status
   coreSheet.getRange(coreRow, 6).setValue(directMgr);
   coreSheet.getRange(coreRow, 7).setValue(funcMgr);
-  
+
   // Update PII: Address, Phone, Hiring Date
-  // Need to find PII row by EmployeeID. 
-  const empID = coreSheet.getRange(coreRow, 1).getValue();
-  
   const piiData = piiSheet.getDataRange().getValues();
   let piiRow = -1;
   for(let i=1; i<piiData.length; i++) {
@@ -3466,16 +3493,23 @@ function activateUser(ss, regRow, hiringDateStr) {
       }
   }
   
-  // If PII row doesn't exist (migration gap), create it
+  // If PII row doesn't exist, create it with the PERMANENT ID
   if (piiRow === -1) {
-      piiSheet.appendRow([empID, new Date(hiringDateStr), "", "", address, phone, "", ""]);
+      piiSheet.appendRow([
+        empID, 
+        new Date(hiringDateStr), 
+        "", "", 
+        address, 
+        phone, 
+        "", ""
+      ]);
   } else {
       piiSheet.getRange(piiRow, 2).setValue(new Date(hiringDateStr));
       piiSheet.getRange(piiRow, 5).setValue(address);
       piiSheet.getRange(piiRow, 6).setValue(phone);
   }
   
-  // Create Folders
+  // Create Folders with PERMANENT ID
    try {
       const rootFolders = DriveApp.getFoldersByName("KOMPASS_HR_Files");
       if (rootFolders.hasNext()) {
@@ -3483,6 +3517,7 @@ function activateUser(ss, regRow, hiringDateStr) {
         const empFolders = root.getFoldersByName("Employee_Files");
         if (empFolders.hasNext()) {
           const parent = empFolders.next();
+          // Folder Name format: Name_KOM-100X
           const personalFolder = parent.createFolder(`${userName}_${empID}`);
           personalFolder.createFolder("Payslips");
           personalFolder.createFolder("Onboarding_Docs");
@@ -3493,7 +3528,7 @@ function activateUser(ss, regRow, hiringDateStr) {
       Logger.log("Folder creation error: " + e.message);
     }
 
-  return { success: true, message: "User fully approved and activated!" };
+  return { success: true, message: `User activated with ID ${empID}!` };
 }
 // --- ADD TO THE END OF code.gs ---
 
@@ -5774,4 +5809,24 @@ function _MASTER_DB_FIXER() {
   }
   
   Logger.log("Master DB Fix Complete.");
+}
+
+// HELPER: Generates the next permanent Employee ID (e.g., KOM-1005)
+function generateNextEmpID(sheet) {
+  const data = sheet.getDataRange().getValues();
+  let maxId = 1000; // Start from 1000
+  
+  for (let i = 1; i < data.length; i++) {
+    const val = String(data[i][0]);
+    // Check if it's a permanent ID (starts with KOM- and is NOT Pending)
+    if (val.startsWith("KOM-") && !val.includes("PENDING")) {
+      const parts = val.split("-");
+      // Assuming format KOM-XXXX
+      const num = parseInt(parts[1]); 
+      if (!isNaN(num) && num > maxId) {
+        maxId = num;
+      }
+    }
+  }
+  return `KOM-${maxId + 1}`;
 }
