@@ -258,32 +258,79 @@ function webGetMyTeam() {
   }
 }
 
-// 2. Updated Reporting Line Change
-function webSubmitMovementRequest(userToMoveEmail, newSupervisorEmail) {
-  // Replaces hardcoded check with dynamic RBAC
-  const { userEmail: requestedByEmail, userData, ss } = getAuthorizedContext('MANAGE_HIERARCHY');
-
+function webSubmitMovementRequest(userToMoveEmail, newSupervisorEmail, newProjectManagerEmail) {
+  const { userEmail: requesterEmail, userData, ss } = getAuthorizedContext('MANAGE_HIERARCHY');
+  
   const userToMoveName = userData.emailToName[userToMoveEmail];
   const newSupervisorName = userData.emailToName[newSupervisorEmail];
-  const fromSupervisorEmail = userData.emailToSupervisor[userToMoveEmail];
-
+  
+  // 1. Validation
   if (!userToMoveName) throw new Error(`User to move (${userToMoveEmail}) not found.`);
   if (!newSupervisorName) throw new Error(`Receiving supervisor (${newSupervisorEmail}) not found.`);
-  if (fromSupervisorEmail === newSupervisorEmail) throw new Error("User already reports to this supervisor.");
+  
+  // FIX: Ensure Project Manager is present. 
+  // If "Keep" was selected but user had no PM, frontend might send blank.
+  if (!newProjectManagerEmail || newProjectManagerEmail === "" || newProjectManagerEmail === "undefined") {
+     throw new Error("Project Manager selection is required. If the user has no current PM, please select 'Change' and assign one.");
+  }
 
+  const requesterRole = userData.emailToRole[requesterEmail];
+  const fromSupervisorEmail = userData.emailToSupervisor[userToMoveEmail];
   const moveSheet = getOrCreateSheet(ss, SHEET_NAMES.movementRequests);
-  moveSheet.appendRow([
-    `MOV-${new Date().getTime()}`,
-    "Pending",
-    userToMoveEmail,
-    userToMoveName,
-    fromSupervisorEmail,
-    newSupervisorEmail,
-    new Date(),
-    "", "", requestedByEmail
-  ]);
 
-  return `Movement request submitted for ${userToMoveName}.`;
+  // 2. SUPER ADMIN LOGIC: Immediate Execution
+  if (requesterRole === 'superadmin') {
+      const dbSheet = getOrCreateSheet(ss, SHEET_NAMES.employeesCore);
+      const userDBRow = userData.emailToRow[userToMoveEmail];
+      
+      if (!userDBRow) throw new Error("Database row not found for user.");
+
+      // Update Employees_Core
+      // Direct Manager is Column F (Index 6)
+      // Functional/Project Manager is Column G (Index 7)
+      dbSheet.getRange(userDBRow, 6).setValue(newSupervisorEmail);
+      dbSheet.getRange(userDBRow, 7).setValue(newProjectManagerEmail);
+
+      // Log as "Approved" in Movement Requests
+      moveSheet.appendRow([
+        `MOV-${new Date().getTime()}`,
+        "Approved", // Auto-approved
+        userToMoveEmail,
+        userToMoveName,
+        fromSupervisorEmail,
+        newSupervisorEmail,
+        new Date(), // Request Time
+        new Date(), // Action Time
+        requesterEmail, // Action By
+        requesterEmail, // Requested By
+        newProjectManagerEmail
+      ]);
+      
+      // Log to System Logs
+      const logsSheet = getOrCreateSheet(ss, SHEET_NAMES.logs);
+      logsSheet.appendRow([new Date(), userToMoveName, requesterEmail, "Movement Auto-Approved", `Moved to ${newSupervisorName} / ${newProjectManagerEmail}`]);
+
+      return `Success: ${userToMoveName} has been moved to ${newSupervisorName} immediately.`;
+  } 
+  
+  // 3. ADMIN LOGIC: Submit for Approval
+  else {
+      moveSheet.appendRow([
+        `MOV-${new Date().getTime()}`,
+        "Pending",
+        userToMoveEmail,
+        userToMoveName,
+        fromSupervisorEmail,
+        newSupervisorEmail,
+        new Date(),
+        "", // ActionTimestamp
+        "", // ActionBy
+        requesterEmail,
+        newProjectManagerEmail
+      ]);
+      
+      return `Request submitted. Waiting for approval from ${newSupervisorName} (or Superadmin).`;
+  }
 }
 /**
  * NEW: Fetches pending movement requests for the admin or their subordinates.
@@ -351,19 +398,16 @@ function webGetPendingMovements() {
   }
 }
 
-/**
- * NEW: Approves or denies a movement request.
- */
 function webApproveDenyMovement(movementID, newStatus) {
   try {
     const adminEmail = Session.getActiveUser().getEmail().toLowerCase();
     const ss = getSpreadsheet();
-    const dbSheet = getOrCreateSheet(ss, SHEET_NAMES.database);
-    const userData = getUserDataFromDb(dbSheet);
+    const dbSheet = getOrCreateSheet(ss, SHEET_NAMES.employeesCore); // Use Core for updates
+    const userData = getUserDataFromDb(ss);
     const moveSheet = getOrCreateSheet(ss, SHEET_NAMES.movementRequests);
     const data = moveSheet.getDataRange().getValues();
     
-    // Get headers
+    // Map Headers to find Columns
     const headers = data[0];
     const idIndex = headers.indexOf("MovementID");
     const statusIndex = headers.indexOf("Status");
@@ -371,75 +415,75 @@ function webApproveDenyMovement(movementID, newStatus) {
     const userToMoveIndex = headers.indexOf("UserToMoveEmail");
     const actionTimeIndex = headers.indexOf("ActionTimestamp");
     const actionByIndex = headers.indexOf("ActionByEmail");
+    // New Header might not exist in old sheets, so we use fixed index 10 (Column 11) or check
+    const toProjMgrIndex = 10; // 0-based index for Column K
 
     let rowToUpdate = -1;
     let requestDetails = {};
 
     for (let i = 1; i < data.length; i++) {
       if (data[i][idIndex] === movementID) {
-        rowToUpdate = i + 1; // 1-based index
+        rowToUpdate = i + 1;
         requestDetails = {
           status: data[i][statusIndex],
           toSupervisorEmail: (data[i][toSupervisorIndex] || "").toLowerCase(),
+          toProjectManagerEmail: (data[i][toProjMgrIndex] || "").toLowerCase(), // Read New PM
           userToMoveEmail: (data[i][userToMoveIndex] || "").toLowerCase()
         };
         break;
       }
     }
 
-    if (rowToUpdate === -1) {
-      throw new Error("Movement request not found.");
-    }
-    if (requestDetails.status !== 'Pending') {
-      throw new Error(`This request has already been ${requestDetails.status}.`);
-    }
+    if (rowToUpdate === -1) throw new Error("Movement request not found.");
+    if (requestDetails.status !== 'Pending') throw new Error(`Request is already ${requestDetails.status}.`);
 
-    // --- MODIFIED: Security Check ---
-    // An admin can action a request if it's FOR them, or FOR a supervisor in their hierarchy.
+    // --- Security Check ---
+    // Approver must be the NEW Supervisor OR a Superadmin
+    // (Or the Admin of the new supervisor)
+    const adminRole = userData.emailToRole[adminEmail];
     
-    // Get all subordinates (direct and indirect)
+    // Get admin's hierarchy
     const mySubordinateEmails = new Set(webGetAllSubordinateEmails(adminEmail));
-    
     const isReceivingSupervisor = (requestDetails.toSupervisorEmail === adminEmail);
-    // Check if the request is for someone who reports to the admin
     const isSupervisorOfReceiver = mySubordinateEmails.has(requestDetails.toSupervisorEmail);
 
-    if (!isReceivingSupervisor && !isSupervisorOfReceiver) {
-      // This check covers all roles. 
-      // An Admin/Superadmin can only approve for their own hierarchy (as you requested: "for a only not for b").
-      throw new Error("Permission denied. You can only approve requests for yourself or for supervisors in your reporting line.");
+    if (adminRole !== 'superadmin' && !isReceivingSupervisor && !isSupervisorOfReceiver) {
+      throw new Error("Permission denied. You can only approve requests assigned to you or your hierarchy.");
     }
-    // --- END MODIFICATION ---
-    // All checks passed, update the status
+
+    // Update Status
     moveSheet.getRange(rowToUpdate, statusIndex + 1).setValue(newStatus);
     moveSheet.getRange(rowToUpdate, actionTimeIndex + 1).setValue(new Date());
     moveSheet.getRange(rowToUpdate, actionByIndex + 1).setValue(adminEmail);
 
     if (newStatus === 'Approved') {
-      // Find the user in the Data Base
       const userDBRow = userData.emailToRow[requestDetails.userToMoveEmail];
-      if (!userDBRow) {
-        throw new Error(`Could not find user ${requestDetails.userToMoveEmail} in Data Base to update.`);
+      if (!userDBRow) throw new Error(`User ${requestDetails.userToMoveEmail} not found in DB.`);
+      
+      // Update Direct Manager (Col F = 6)
+      dbSheet.getRange(userDBRow, 6).setValue(requestDetails.toSupervisorEmail);
+      
+      // Update Project Manager (Col G = 7)
+      // Only if we have a valid new project manager
+      if (requestDetails.toProjectManagerEmail) {
+         dbSheet.getRange(userDBRow, 7).setValue(requestDetails.toProjectManagerEmail);
       }
-      // Update their supervisor (Column G = 7)
-      dbSheet.getRange(userDBRow, 7).setValue(requestDetails.toSupervisorEmail);
 
-      // Log the change
+      // Log
       const logsSheet = getOrCreateSheet(ss, SHEET_NAMES.logs);
       logsSheet.appendRow([
         new Date(), 
-        userData.emailToName[requestDetails.userToMoveEmail] || "Unknown User", 
+        userData.emailToName[requestDetails.userToMoveEmail], 
         adminEmail, 
         "Reporting Line Change Approved", 
-        `MovementID: ${movementID}`
+        `Direct: ${requestDetails.toSupervisorEmail}, Project: ${requestDetails.toProjectManagerEmail}`
       ]);
     }
     
     SpreadsheetApp.flush();
-    return { success: true, message: `Request has been ${newStatus}.` };
+    return { success: true, message: `Request ${newStatus}.` };
 
   } catch (e) {
-    Logger.log("webApproveDenyMovement Error: " + e.message);
     return { error: e.message };
   }
 }
@@ -1178,13 +1222,10 @@ function getUserInfo() {
     const KONECTA_DOMAIN = "@konecta.com"; 
     
     // FIX: Robust check to prevent duplicates on refresh
-    // 1. Check our loaded data
     let userExists = userData.emailToName[userEmail] !== undefined;
 
-    // 2. If not found in data, do a DIRECT SHEET CHECK to be absolutely sure
-    // (This handles cases where the helper might miss a recently added row)
     if (!userExists && userEmail.endsWith(KONECTA_DOMAIN)) {
-      const emailColumn = dbSheet.getRange("C:C").getValues(); // Column C is Email
+      const emailColumn = dbSheet.getRange("C:C").getValues();
       for (let i = 0; i < emailColumn.length; i++) {
         if (String(emailColumn[i][0]).trim().toLowerCase() === userEmail) {
           userExists = true;
@@ -1193,7 +1234,6 @@ function getUserInfo() {
       }
     }
 
-    // Only append if they TRULY do not exist
     if (!userExists && userEmail.endsWith(KONECTA_DOMAIN)) {
       isNewUser = true;
       const nameParts = userEmail.split('@')[0].split('.');
@@ -1201,10 +1241,8 @@ function getUserInfo() {
       const lastName = nameParts[1] ? nameParts[1].charAt(0).toUpperCase() + nameParts[1].slice(1) : '';
       const newName = [firstName, lastName].join(' ').trim();
       const newEmpID = "KOM-PENDING-" + new Date().getTime();
-      
       dbSheet.appendRow([newEmpID, newName || userEmail, userEmail, 'agent', 'Pending', "", "", 0, 0, 0, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "Pending"]);
       SpreadsheetApp.flush(); 
-      // Refresh user data after append
       userData = getUserDataFromDb(ss);
     }
     
@@ -1222,11 +1260,12 @@ function getUserInfo() {
 
     let allUsers = [];
     let allAdmins = [];
-    // Only show full user list to non-agents, OR new users (to select managers), OR pending users
     if (role !== 'agent' || isNewUser || accountStatus === 'Pending') { 
       allUsers = userData.userList;
     }
-    allAdmins = userData.userList.filter(u => u.role === 'admin' || u.role === 'superadmin' || u.role === 'manager');
+    // FIX: Add 'project_manager' to the list of admins/managers
+    allAdmins = userData.userList.filter(u => u.role === 'admin' || u.role === 'superadmin' || u.role === 'manager' || u.role === 'project_manager');
+    
     const myBalances = userData.emailToBalances[userEmail] || { annual: 0, sick: 0, casual: 0 };
     let hasPendingRoleRequests = false;
     if (role === 'superadmin') {
@@ -1235,20 +1274,18 @@ function getUserInfo() {
       for (let i = 1; i < data.length; i++) { if (data[i][7] === 'Pending') { hasPendingRoleRequests = true; break; } }
     }
 
-    // --- GET PERMISSIONS ---
     const rbacMap = getPermissionsMap(ss);
     const myPermissions = [];
     for (const [perm, roles] of Object.entries(rbacMap)) {
       if (roles[role]) myPermissions.push(perm);
     }
 
-    // --- NEW PHASE 3: GET BREAK CONFIGS ---
     const breakRules = {
       break1: getBreakConfig("First Break").default,
       lunch: getBreakConfig("Lunch").default,
       break2: getBreakConfig("Last Break").default,
-      otPre: getBreakConfig("Overtime Pre-Shift").default, // Phase 8
-      otPost: getBreakConfig("Overtime Post-Shift").default // Phase 8
+      otPre: getBreakConfig("Overtime Pre-Shift").default,
+      otPost: getBreakConfig("Overtime Post-Shift").default
     };
 
     return {
@@ -1692,13 +1729,11 @@ function createDateTime(dateObj, timeStr) {
 
 function getUserDataFromDb(ss) {
   if (!ss || !ss.getSheetByName) ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  
   const coreSheet = getOrCreateSheet(ss, SHEET_NAMES.employeesCore);
   const piiSheet = getOrCreateSheet(ss, SHEET_NAMES.employeesPII); 
 
   const coreData = coreSheet.getDataRange().getValues();
   const piiData = piiSheet.getDataRange().getValues();
-
   const piiMap = {};
   for (let i = 1; i < piiData.length; i++) {
     const empID = piiData[i][0];
@@ -1721,7 +1756,7 @@ function getUserDataFromDb(ss) {
   const colIdx = {};
   headers.forEach((header, index) => { colIdx[header] = index; });
 
-  const defaultDirectMgrIdx = 5; 
+  const defaultDirectMgrIdx = 5; // Fallback to Col F (Index 5) if headers fail
 
   for (let i = 1; i < coreData.length; i++) {
     try {
@@ -1735,18 +1770,21 @@ function getUserDataFromDb(ss) {
         const cleanEmail = email.toString().trim().toLowerCase();
         const userRole = (row[colIdx["Role"] || 3] || 'agent').toString().trim().toLowerCase();
         const accountStatus = (row[colIdx["AccountStatus"] || 4] || "Pending").toString().trim();
-        
-        // --- MANAGER FETCHING (Removed Functional) ---
+
+        // --- MANAGER FETCHING (FIXED) ---
         let dmIdx = colIdx["DirectManagerEmail"];
         if (dmIdx === undefined) dmIdx = colIdx["DirectManager"]; 
         if (dmIdx === undefined) dmIdx = defaultDirectMgrIdx;
 
+        // FIX: Check for "FunctionalManagerEmail" (Col G) explicitly
         let pmIdx = colIdx["ProjectManagerEmail"];
         if (pmIdx === undefined) pmIdx = colIdx["ProjectManager"];
+        if (pmIdx === undefined) pmIdx = colIdx["FunctionalManagerEmail"]; 
 
         let dotIdx = colIdx["DottedManager"];
 
         const directMgr = (row[dmIdx] || "").toString().trim().toLowerCase();
+        // If pmIdx is still undefined, projectMgr will be empty string
         const projectMgr = (pmIdx !== undefined ? row[pmIdx] : "").toString().trim().toLowerCase();
         const dottedMgr = (dotIdx !== undefined ? row[dotIdx] : "").toString().trim().toLowerCase();
         // ---------------------------------------------
@@ -1761,7 +1799,6 @@ function getUserDataFromDb(ss) {
         
         emailToSupervisor[cleanEmail] = directMgr;
         emailToProjectManager[cleanEmail] = projectMgr;
-        
         emailToAccountStatus[cleanEmail] = accountStatus;
         emailToHiringDate[cleanEmail] = hiringDateStr;
 
@@ -1778,7 +1815,7 @@ function getUserDataFromDb(ss) {
           role: userRole,
           balances: emailToBalances[cleanEmail],
           supervisor: directMgr,
-          projectManager: projectMgr,
+          projectManager: projectMgr, // This will now populate correctly
           dottedManager: dottedMgr,
           accountStatus: accountStatus,
           hiringDate: hiringDateStr
@@ -5858,13 +5895,14 @@ function webSaveBreakConfig(newConfigs) {
 
 
 
+// [code.gs] FIXED: Corrected History and Adherence Schemas
 function _MASTER_DB_FIXER() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   Logger.log("Starting Master DB Fixer...");
 
   // 1. Define Schema
   const schema = {
-    [SHEET_NAMES.rbac]: ["PermissionID", "Description", "superadmin", "admin", "manager", "financial_manager", "agent"],
+    [SHEET_NAMES.rbac]: ["PermissionID", "Description", "superadmin", "admin", "manager", "project_manager", "financial_manager", "agent"],
     [SHEET_NAMES.employeesCore]: ["EmployeeID", "Name", "Email", "Role", "AccountStatus", "DirectManagerEmail", "FunctionalManagerEmail", "AnnualBalance", "SickBalance", "CasualBalance", "Gender", "EmploymentType", "ContractType", "JobLevel", "Department", "Function", "SubFunction", "GCMLevel", "Scope", "OffshoreOnshore", "DottedManager", "ProjectManagerEmail", "BonusPlan", "N_Level", "ExitDate", "Status"],
     [SHEET_NAMES.employeesPII]: ["EmployeeID", "HiringDate", "Salary", "IBAN", "Address", "Phone", "MedicalInfo", "ContractType", "NationalID", "PassportNumber", "SocialInsuranceNumber", "BirthDate", "PersonalEmail", "MaritalStatus", "DependentsInfo", "EmergencyContact", "EmergencyRelation", "BasicSalary", "VariablePay", "HourlyRate"],
     [SHEET_NAMES.financialEntitlements]: ["EntitlementID", "EmployeeEmail", "EmployeeName", "Type", "Amount", "Currency", "DueDate", "Status", "Description", "AddedBy", "DateAdded"],
@@ -5872,7 +5910,13 @@ function _MASTER_DB_FIXER() {
     [SHEET_NAMES.recruitment]: ["CandidateID", "Name", "Email", "Phone", "Position", "CV_Link", "Status", "Stage", "InterviewScores", "AppliedDate", "NationalID", "LangLevel", "SecondLang", "Referrer", "HR_Feedback", "Mgmt_Feedback", "Tech_Feedback", "Client_Feedback", "OfferStatus", "RejectionReason", "HistoryLog"],
     [SHEET_NAMES.requisitions]: ["ReqID", "Title", "Department", "HiringManager", "OpenDate", "Status", "PoolCandidates", "JobDescription"],
     [SHEET_NAMES.performance]: ["ReviewID", "EmployeeID", "Year", "ReviewPeriod", "Rating", "ManagerComments", "Date"],
-    [SHEET_NAMES.historyLogs]: ["Date", "User Name", "Login", "First Break In", "First Break Out", "Lunch In", "Lunch Out", "Last Break In", "Last Break Out", "Logout", "Tardy (Seconds)", "Overtime (Seconds)", "Early Leave (Seconds)", "Leave Type", "Admin Audit", "—", "1st Break Exceed", "Lunch Exceed", "Last Break Exceed", "Absent", "Admin Code", "BreakWindowViolation", "NetLoginHours", "PreShiftOvertime"],
+    
+    // CORRECTION: Employee_History (HR Logs)
+    [SHEET_NAMES.historyLogs]: ["HistoryID", "EmployeeID", "Date", "EventType", "OldValue", "NewValue"],
+    
+    // CORRECTION: Adherence Tracker (Daily Punches) - Was missing or wrong
+    [SHEET_NAMES.adherence]: ["Date", "User Name", "Login", "First Break In", "First Break Out", "Lunch In", "Lunch Out", "Last Break In", "Last Break Out", "Logout", "Tardy (Seconds)", "Overtime (Seconds)", "Early Leave (Seconds)", "Leave Type", "Admin Audit", "—", "1st Break Exceed", "Lunch Exceed", "Last Break Exceed", "Absent", "Admin Code", "BreakWindowViolation", "NetLoginHours", "PreShiftOvertime", "LastAction", "LastActionTimestamp"],
+
     [SHEET_NAMES.schedule]: ["Name", "StartDate", "ShiftStartTime", "EndDate", "ShiftEndTime", "LeaveType", "agent email"],
     [SHEET_NAMES.logs]: ["Timestamp", "User Name", "Email", "Action", "Time"],
     [SHEET_NAMES.otherCodes]: ["Date", "User Name", "Code", "Time In", "Time Out", "Duration (Seconds)", "Admin Audit (Email)"],
@@ -5881,7 +5925,7 @@ function _MASTER_DB_FIXER() {
     [SHEET_NAMES.coachingScores]: ["SessionID", "Category", "Criteria", "Score", "Comment"],
     [SHEET_NAMES.coachingTemplates]: ["TemplateName", "Category", "Criteria", "Status"],
     [SHEET_NAMES.leaveRequests]: ["RequestID", "Status", "RequestedByEmail", "RequestedByName", "LeaveType", "StartDate", "EndDate", "TotalDays", "Reason", "ActionDate", "ActionBy", "SupervisorEmail", "ActionReason", "SickNoteURL", "DirectManagerSnapshot", "ProjectManagerSnapshot"],
-    [SHEET_NAMES.movementRequests]: ["MovementID", "Status", "UserToMoveEmail", "UserToMoveName", "FromSupervisorEmail", "ToSupervisorEmail", "RequestTimestamp", "ActionTimestamp", "ActionByEmail", "RequestedByEmail"],
+    [SHEET_NAMES.movementRequests]: ["MovementID", "Status", "UserToMoveEmail", "UserToMoveName", "FromSupervisorEmail", "ToSupervisorEmail", "RequestTimestamp", "ActionTimestamp", "ActionByEmail", "RequestedByEmail", "ToProjectManagerEmail"], 
     [SHEET_NAMES.roleRequests]: ["RequestID", "UserEmail", "UserName", "CurrentRole", "RequestedRole", "Justification", "RequestTimestamp", "Status", "ActionByEmail", "ActionTimestamp"],
     [SHEET_NAMES.projects]: ["ProjectID", "ProjectName", "ProjectManagerEmail", "AllowedRoles"],
     [SHEET_NAMES.projectLogs]: ["LogID", "EmployeeID", "ProjectID", "Date", "HoursLogged"],
@@ -5895,17 +5939,12 @@ function _MASTER_DB_FIXER() {
     let sheet = getOrCreateSheet(ss, sheetName);
     const lastCol = sheet.getLastColumn();
     let currentHeaders = [];
-    
-    // Only fetch headers if the sheet is not empty
     if (lastCol > 0) {
       currentHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
     }
-
     const missingCols = [];
     headers.forEach(h => { if (!currentHeaders.includes(h)) missingCols.push(h); });
-
     if (missingCols.length > 0) {
-      // Append to the next available column (startCol = 1 if empty, else lastCol + 1)
       const startCol = lastCol === 0 ? 1 : lastCol + 1;
       sheet.getRange(1, startCol, 1, missingCols.length).setValues([missingCols]);
       Logger.log(`Updated ${sheetName}: Added [${missingCols.join(', ')}]`);
@@ -5914,32 +5953,43 @@ function _MASTER_DB_FIXER() {
 
   // 3. Populate Permissions (RBAC)
   const rbacSheet = ss.getSheetByName(SHEET_NAMES.rbac);
-  if (rbacSheet.getLastRow() <= 1) {
-    const permissions = [
-      ["PUNCH_OTHERS", "Clock in others", true, true, true, false, false],
-      ["EDIT_SCHEDULE", "Manage Schedules", true, true, true, false, false],
-      ["APPROVE_LEAVE", "Approve Leave", true, true, true, false, false],
-      ["MANAGE_BALANCES", "Edit Leave Balances", true, true, false, false, false],
-      ["MANAGE_RECRUITMENT", "Hire/Reject Candidates", true, false, false, false, false],
-      ["HIRE_EMPLOYEE", "Finalize Hiring", true, false, false, false, false],
-      ["OFFBOARD_EMPLOYEE", "Terminate Staff", true, true, false, false, false],
-      ["SUBMIT_COACHING", "Perform Coaching", true, true, true, false, false],
-      ["MANAGE_TEMPLATES", "Edit Coaching Forms", true, true, false, false, false],
-      ["MANAGE_FINANCE", "Payroll/Bonuses", true, false, false, true, false],
-      ["MANAGE_PROJECTS", "Create Projects", true, true, false, false, false],
-      ["MANAGE_ANNOUNCEMENTS", "Post Announcements", true, false, false, false, false],
-      ["VIEW_FULL_DASHBOARD", "See Team Stats", true, true, true, false, false],
-      ["MANAGE_HIERARCHY", "Move Reporting Lines", true, true, false, false, false],
-      ["MANAGE_RBAC", "Edit Permissions", true, false, false, false, false],
-      ["SUBMIT_PERFORMANCE", "Submit Reviews", true, true, true, false, false], // Added for Phase 5
-      ["MANAGE_OVERTIME", "Approve/Pre-approve Overtime", true, true, true, false, false] // NEW PHASE 8
-    ];
-    rbacSheet.getRange(2, 1, permissions.length, 7).setValues(permissions);
-    Logger.log("RBAC Permissions Populated.");
+  if (rbacSheet.getLastRow() > 1) {
+     rbacSheet.getRange(2, 1, rbacSheet.getLastRow()-1, rbacSheet.getLastColumn()).clearContent();
   }
+  
+  // Format: [PermissionID, Desc, Superadmin, Admin, Manager, Project_Manager, Fin_Manager, Agent]
+  const permissions = [
+    ["PUNCH_OTHERS", "Clock in others", true, true, true, true, false, false],
+    ["EDIT_SCHEDULE", "Manage Schedules", true, true, true, true, false, false],
+    ["APPROVE_LEAVE", "Approve Leave", true, true, true, true, false, false],
+    ["MANAGE_BALANCES", "Edit Leave Balances", true, true, false, false, false, false],
+    ["MANAGE_RECRUITMENT", "Hire/Reject Candidates", true, false, false, false, false, false],
+    ["HIRE_EMPLOYEE", "Finalize Hiring", true, false, false, false, false, false],
+    ["OFFBOARD_EMPLOYEE", "Terminate Staff", true, true, false, false, false, false],
+    ["SUBMIT_COACHING", "Perform Coaching", true, true, true, true, false, false],
+    ["MANAGE_TEMPLATES", "Edit Coaching Forms", true, true, false, false, false, false],
+    ["MANAGE_FINANCE", "Payroll/Bonuses", true, false, false, false, true, false],
+    ["MANAGE_PROJECTS", "Create Projects", true, true, false, true, false, false],
+    ["MANAGE_ANNOUNCEMENTS", "Post Announcements", true, false, false, false, false, false],
+    ["VIEW_FULL_DASHBOARD", "See Team Stats", true, true, true, true, false, false],
+    ["MANAGE_HIERARCHY", "Move Reporting Lines", true, true, false, false, false, false],
+    ["MANAGE_RBAC", "Edit Permissions", true, false, false, false, false, false],
+    ["SUBMIT_PERFORMANCE", "Submit Reviews", true, true, true, true, false, false],
+    ["MANAGE_OVERTIME", "Approve/Pre-approve Overtime", true, true, true, true, false, false]
+  ];
+  rbacSheet.getRange(2, 1, permissions.length, 8).setValues(permissions); // Width is 8 now
   
   Logger.log("Master DB Fix Complete.");
 }
+
+
+
+
+
+
+
+
+
 
 // HELPER: Generates the next permanent Employee ID (e.g., KOM-1005)
 function generateNextEmpID(sheet) {
